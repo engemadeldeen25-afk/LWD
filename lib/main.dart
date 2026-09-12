@@ -24,10 +24,6 @@ class GeoMacLabApp extends StatelessWidget {
         primaryColor: const Color(0xFF0A192F),
         scaffoldBackgroundColor: const Color(0xFF0A192F),
         cardColor: const Color(0xFF112240),
-        appBarTheme: const AppBarTheme(
-          backgroundColor: Color(0xFF0A192F),
-          elevation: 0,
-        ),
       ),
       home: const HomePage(),
     );
@@ -41,33 +37,36 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin {
-  // BLE State
+class _HomePageState extends State<HomePage>
+    with SingleTickerProviderStateMixin {
+  // ---------- BLE ----------
   BluetoothDevice? _device;
+  BluetoothCharacteristic? _notifyCharacteristic;
+  StreamSubscription<List<int>>? _bleSubscription;
   bool _isScanning = false;
   bool _isConnected = false;
   String _connectionStatus = "Disconnected";
 
-  // Test Data
+  // ---------- Data ----------
   Map<String, double> _lastReading = {"evd": 0, "def": 0, "lat": 0, "lng": 0};
   int _satellites = 0;
   int _testCounter = 0;
   final List<double> _deflectionHistory = List.filled(30, 0.0);
 
-  // CSV Logging
+  // ---------- CSV ----------
   final List<List<dynamic>> _csvData = [
     ["Test #", "Timestamp", "Evd (MN/m²)", "Def (mm)", "Latitude", "Longitude", "Satellites"]
   ];
 
-  // Animation
+  // ---------- Animation ----------
   late AnimationController _pulseController;
   final ValueNotifier<double> _gaugeValue = ValueNotifier(0.0);
 
-  // GPS Caching
+  // ---------- GPS cache ----------
   double _lastKnownLat = 0.0;
   double _lastKnownLng = 0.0;
 
-  // Calibration
+  // ---------- Calibration ----------
   double _calibrationFactor = 1.0;
   String _calibrationDate = 'Never';
   final String _password = 'admin123';
@@ -76,68 +75,115 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   @override
   void initState() {
     super.initState();
-    _pulseController = AnimationController(vsync: this, duration: const Duration(seconds: 1));
+    _pulseController =
+        AnimationController(vsync: this, duration: const Duration(seconds: 1));
     _loadCalibration();
     _requestPermissions();
-    _startScanning();
     _checkGpsService();
+    // Start scanning after a short delay so permissions dialog can appear first
+    Future.delayed(const Duration(seconds: 1), _startScanning);
   }
 
   @override
   void dispose() {
+    _bleSubscription?.cancel();
     _pulseController.dispose();
     _gaugeValue.dispose();
     super.dispose();
   }
 
+  // ========== Permissions ==========
   Future<void> _requestPermissions() async {
     await Permission.location.request();
     await Permission.bluetoothScan.request();
     await Permission.bluetoothConnect.request();
   }
 
+  // ========== BLE Scan ==========
   void _startScanning() {
+    if (!mounted) return;
     setState(() => _isScanning = true);
-    FlutterBluePlus.startScan(timeout: const Duration(seconds: 4));
+
+    FlutterBluePlus.startScan(timeout: const Duration(seconds: 6));
+
     FlutterBluePlus.scanResults.listen((results) {
       for (ScanResult r in results) {
-        if (r.device.name.contains("LWD-BMI160-Probe")) {
-          _connectToDevice(r.device);
+        final name = r.device.platformName;
+        if (name.contains("LWD-BMI160-Probe") || name.contains("LWD-Probe")) {
           FlutterBluePlus.stopScan();
-          setState(() => _isScanning = false);
+          if (mounted) setState(() => _isScanning = false);
+          _connectToDevice(r.device);
           return;
         }
       }
     });
-    Future.delayed(const Duration(seconds: 5), () => setState(() => _isScanning = false));
+
+    Future.delayed(const Duration(seconds: 7), () {
+      if (mounted) setState(() => _isScanning = false);
+    });
   }
 
+  // ========== BLE Connect (Fixed for flutter_blue_plus 1.35+) ==========
   Future<void> _connectToDevice(BluetoothDevice device) async {
     setState(() {
       _device = device;
       _connectionStatus = "Connecting...";
     });
+
     try {
-      await device.connect();
-      await device.discoverServices();
-      var char = device.services
-          .expand((s) => s.characteristics)
-          .firstWhere((c) => c.uuid.toString() == "6e400002-b5a3-f393-e0a9-e50e24dcca9e");
-      await char.setNotifyValue(true);
-      char.onValueReceived.listen((event) {
-        String raw = String.fromCharCodes(event.value);
-        _parseIncomingData(raw);
+      await device.connect(timeout: const Duration(seconds: 15));
+
+      // Discover services - returns List<BluetoothService>
+      final List<BluetoothService> services =
+          await device.discoverServices();
+
+      // Find target characteristic by UUID
+      BluetoothCharacteristic? targetChar;
+      for (final BluetoothService service in services) {
+        for (final BluetoothCharacteristic c in service.characteristics) {
+          if (c.uuid.toString().toLowerCase() ==
+              "6e400002-b5a3-f393-e0a9-e50e24dcca9e") {
+            targetChar = c;
+            break;
+          }
+        }
+        if (targetChar != null) break;
+      }
+
+      if (targetChar == null) {
+        throw Exception("Notification characteristic not found on device");
+      }
+
+      _notifyCharacteristic = targetChar;
+
+      // Enable notifications
+      await targetChar.setNotifyValue(true);
+
+      // Listen for incoming data
+      _bleSubscription =
+          targetChar.onValueReceived.listen((List<int> value) {
+        if (value.isNotEmpty) {
+          final String raw = String.fromCharCodes(value);
+          _parseIncomingData(raw);
+        }
       });
+
+      if (!mounted) return;
       setState(() {
         _isConnected = true;
         _connectionStatus = "Online";
       });
       _pulseController.repeat(reverse: true);
-      Vibration.vibrate(duration: 50);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("✅ Connected to LWD Probe!")),
-      );
+
+      _safeVibrate(50);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("✅ Connected to LWD Probe!")),
+        );
+      }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _isConnected = false;
         _connectionStatus = "Failed";
@@ -148,19 +194,40 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     }
   }
 
+  // ========== Safe vibration helper ==========
+  Future<void> _safeVibrate(int durationMs) async {
+    try {
+      final bool hasVib = await Vibration.hasVibrator() ?? false;
+      if (hasVib) {
+        Vibration.vibrate(duration: durationMs);
+      }
+    } catch (_) {
+      // Vibration not available — ignore
+    }
+  }
+
+  // ========== Parse Data ==========
   void _parseIncomingData(String jsonStr) {
     try {
-      Map<String, dynamic> data = {};
-      jsonStr.replaceAll("{", "").replaceAll("}", "").split(",").forEach((pair) {
-        var kv = pair.split(":");
+      final Map<String, double> data = {};
+      jsonStr
+          .replaceAll("{", "")
+          .replaceAll("}", "")
+          .split(",")
+          .forEach((pair) {
+        final kv = pair.split(":");
         if (kv.length == 2) {
-          data[kv[0].replaceAll('"', '').trim()] = double.tryParse(kv[1].trim()) ?? 0.0;
+          final key = kv[0].replaceAll('"', '').trim();
+          final val = double.tryParse(kv[1].trim());
+          if (val != null) data[key] = val;
         }
       });
 
-      double rawEvd = data["evd"] ?? 0;
-      double def = data["def"] ?? 0;
-      double calibratedEvd = rawEvd * _calibrationFactor;
+      final double rawEvd = data["evd"] ?? 0;
+      final double def = data["def"] ?? 0;
+      final double calibratedEvd = rawEvd * _calibrationFactor;
+
+      if (!mounted) return;
 
       setState(() {
         _lastReading["evd"] = calibratedEvd;
@@ -170,7 +237,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         if (_deflectionHistory.length > 30) _deflectionHistory.removeAt(0);
       });
 
-      Vibration.vibrate(duration: 20);
+      _safeVibrate(20);
 
       if (calibratedEvd > 0.5) {
         _logTestWithPhoneGps(calibratedEvd, def);
@@ -180,49 +247,52 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     }
   }
 
+  // ========== Log test with phone GPS ==========
   Future<void> _logTestWithPhoneGps(double evd, double def) async {
     double lat = _lastKnownLat;
     double lng = _lastKnownLng;
-    int satCount = 0;
+    const int satCount = 0; // not available in geolocator 13.x
 
     try {
-      Position? pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.best,
-        timeLimit: const Duration(seconds: 3),
-      ).timeout(const Duration(seconds: 3));
-      if (pos != null) {
+      final bool serviceEnabled =
+          await Geolocator.isLocationServiceEnabled();
+      if (serviceEnabled) {
+        final Position pos = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high,
+          timeLimit: const Duration(seconds: 3),
+        );
         lat = pos.latitude;
         lng = pos.longitude;
-        satCount = 0; // pos.satellite not available in newer geolocator
         _lastKnownLat = lat;
         _lastKnownLng = lng;
       }
     } catch (e) {
-      print("GPS error, using cached position: $e");
+      print("GPS error (using cached): $e");
     }
 
-    if (mounted) {
-      setState(() {
-        _lastReading["lat"] = lat;
-        _lastReading["lng"] = lng;
-        _satellites = satCount;
-        _testCounter++;
-        _csvData.add([
-          _testCounter,
-          DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.now()),
-          evd.toStringAsFixed(1),
-          def.toStringAsFixed(3),
-          lat.toStringAsFixed(6),
-          lng.toStringAsFixed(6),
-          satCount,
-        ]);
-      });
-    }
+    if (!mounted) return;
+
+    setState(() {
+      _lastReading["lat"] = lat;
+      _lastReading["lng"] = lng;
+      _satellites = satCount;
+      _testCounter++;
+      _csvData.add([
+        _testCounter,
+        DateFormat('yyyy-MM-dd HH:mm:ss').format(DateTime.now()),
+        evd.toStringAsFixed(1),
+        def.toStringAsFixed(3),
+        lat.toStringAsFixed(6),
+        lng.toStringAsFixed(6),
+        satCount,
+      ]);
+    });
   }
 
-  // Calibration Persistence
+  // ========== Calibration persistence ==========
   Future<void> _loadCalibration() async {
     _prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() {
       _calibrationFactor = _prefs.getDouble('calibrationFactor') ?? 1.0;
       _calibrationDate = _prefs.getString('calibrationDate') ?? 'Never';
@@ -231,22 +301,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
 
   Future<void> _saveCalibration(double factor) async {
     await _prefs.setDouble('calibrationFactor', factor);
-    await _prefs.setString('calibrationDate', DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now()));
+    await _prefs.setString(
+        'calibrationDate', DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now()));
+    if (!mounted) return;
     setState(() {
       _calibrationFactor = factor;
       _calibrationDate = _prefs.getString('calibrationDate')!;
     });
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('✅ Calibration saved: ${factor.toStringAsFixed(3)}')),
+      SnackBar(
+          content: Text('✅ Calibration saved: ${factor.toStringAsFixed(3)}')),
     );
   }
 
+  // ========== Calibration Dialogs ==========
   void _showCalibrationDialog() {
-    TextEditingController passwordController = TextEditingController();
+    final TextEditingController passwordController = TextEditingController();
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         title: const Text('🔐 Calibration Unlock'),
         content: TextField(
           controller: passwordController,
@@ -259,13 +333,13 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(ctx),
             child: const Text('Cancel'),
           ),
           TextButton(
             onPressed: () {
               if (passwordController.text == _password) {
-                Navigator.pop(context);
+                Navigator.pop(ctx);
                 _showCalibrationEditor();
               } else {
                 ScaffoldMessenger.of(context).showSnackBar(
@@ -281,12 +355,12 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
   }
 
   void _showCalibrationEditor() {
-    TextEditingController factorController =
+    final TextEditingController factorController =
         TextEditingController(text: _calibrationFactor.toStringAsFixed(3));
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         title: const Text('Adjust Calibration Factor'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -306,7 +380,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             const SizedBox(height: 16),
             Row(
               children: [
-                const Icon(Icons.calendar_today, size: 14, color: Colors.grey),
+                const Icon(Icons.calendar_today,
+                    size: 14, color: Colors.grey),
                 const SizedBox(width: 6),
                 Text('Last calibration: $_calibrationDate',
                     style: const TextStyle(fontSize: 12, color: Colors.grey)),
@@ -316,18 +391,20 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(ctx),
             child: const Text('Cancel'),
           ),
           ElevatedButton(
             onPressed: () {
-              double? newFactor = double.tryParse(factorController.text);
+              final double? newFactor =
+                  double.tryParse(factorController.text);
               if (newFactor != null && newFactor > 0) {
                 _saveCalibration(newFactor);
-                Navigator.pop(context);
+                Navigator.pop(ctx);
               } else {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('❌ Enter a valid positive number')),
+                  const SnackBar(
+                      content: Text('❌ Enter a valid positive number')),
                 );
               }
             },
@@ -338,35 +415,53 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     );
   }
 
+  // ========== GPS check ==========
   void _checkGpsService() async {
     WidgetsBinding.instance.addPostFrameCallback((_) async {
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
+      final bool enabled = await Geolocator.isLocationServiceEnabled();
+      if (!enabled && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('⚠️ Please enable GPS for accurate test locations.')),
+          const SnackBar(
+              content: Text('⚠️ Please enable GPS for test locations.')),
         );
       }
     });
   }
 
+  // ========== CSV Export ==========
   Future<void> _exportCSV() async {
-    String csv = const ListToCsvConverter().convert(_csvData);
+    final String csv = const ListToCsvConverter().convert(_csvData);
     try {
-      String path = "/storage/emulated/0/Download/LWD_Report_${DateTime.now().millisecondsSinceEpoch}.csv";
-      File file = File(path);
+      final String path =
+          "/storage/emulated/0/Download/LWD_Report_${DateTime.now().millisecondsSinceEpoch}.csv";
+      final File file = File(path);
       await file.writeAsString(csv);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("📁 Report saved to Downloads!")),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("📁 Report saved to Downloads!")),
+        );
+      }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("⚠️ CSV Data ready, but save failed: $e")),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("⚠️ CSV ready, but save failed: $e")),
+        );
+      }
     }
   }
 
-  void _disconnect() {
-    _device?.disconnect();
+  // ========== Disconnect ==========
+  Future<void> _disconnect() async {
+    try {
+      await _bleSubscription?.cancel();
+    } catch (_) {}
+    _bleSubscription = null;
+    try {
+      await _device?.disconnect();
+    } catch (_) {}
+    _device = null;
+    _notifyCharacteristic = null;
+    if (!mounted) return;
     setState(() {
       _isConnected = false;
       _connectionStatus = "Disconnected";
@@ -374,6 +469,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
     });
   }
 
+  // ========== UI ==========
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -384,7 +480,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
             const SizedBox(width: 10),
             const Text(
               "GEO.MACLAB_2050",
-              style: TextStyle(fontWeight: FontWeight.bold, letterSpacing: 1.5, fontSize: 18),
+              style: TextStyle(
+                  fontWeight: FontWeight.bold, letterSpacing: 1.5, fontSize: 18),
             ),
             const Spacer(),
             IconButton(
@@ -393,14 +490,18 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               tooltip: 'Calibration',
             ),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
-                color: _isConnected ? Colors.green.shade900 : Colors.red.shade900,
+                color: _isConnected
+                    ? Colors.green.shade900
+                    : Colors.red.shade900,
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Text(
                 _connectionStatus,
-                style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+                style: const TextStyle(
+                    fontSize: 10, fontWeight: FontWeight.bold),
               ),
             ),
             const SizedBox(width: 8),
@@ -428,7 +529,6 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
-            // Dashboard Card
             Container(
               decoration: BoxDecoration(
                 gradient: const LinearGradient(
@@ -437,9 +537,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 borderRadius: BorderRadius.circular(20),
                 boxShadow: [
                   BoxShadow(
-                    color: Colors.blue.withOpacity(0.1),
-                    blurRadius: 20,
-                  ),
+                      color: Colors.blue.withOpacity(0.1), blurRadius: 20),
                 ],
               ),
               padding: const EdgeInsets.all(20),
@@ -448,22 +546,26 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      const Text(
-                        'CALIBRATION',
-                        style: TextStyle(color: Colors.grey, fontSize: 10, letterSpacing: 1),
-                      ),
+                      const Text('CALIBRATION',
+                          style: TextStyle(
+                              color: Colors.grey,
+                              fontSize: 10,
+                              letterSpacing: 1)),
                       Row(
                         children: [
-                          const Icon(Icons.check_circle, color: Colors.green, size: 14),
+                          const Icon(Icons.check_circle,
+                              color: Colors.green, size: 14),
                           const SizedBox(width: 4),
                           Text(
                             'Factor: ${_calibrationFactor.toStringAsFixed(3)}',
-                            style: const TextStyle(color: Colors.grey, fontSize: 12),
+                            style: const TextStyle(
+                                color: Colors.grey, fontSize: 12),
                           ),
                           const SizedBox(width: 8),
                           Text(
                             'Updated: $_calibrationDate',
-                            style: const TextStyle(color: Colors.grey, fontSize: 10),
+                            style: const TextStyle(
+                                color: Colors.grey, fontSize: 10),
                           ),
                         ],
                       ),
@@ -476,10 +578,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                       Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          const Text(
-                            "EVD MODULUS",
-                            style: TextStyle(color: Colors.grey, fontSize: 12, letterSpacing: 1),
-                          ),
+                          const Text("EVD MODULUS",
+                              style: TextStyle(
+                                  color: Colors.grey,
+                                  fontSize: 12,
+                                  letterSpacing: 1)),
                           Row(
                             children: [
                               AnimatedSwitcher(
@@ -494,10 +597,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                                   ),
                                 ),
                               ),
-                              const Text(
-                                " MN/m²",
-                                style: TextStyle(color: Colors.grey, fontSize: 16),
-                              ),
+                              const Text(" MN/m²",
+                                  style: TextStyle(
+                                      color: Colors.grey, fontSize: 16)),
                             ],
                           ),
                         ],
@@ -505,10 +607,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                       Column(
                         crossAxisAlignment: CrossAxisAlignment.end,
                         children: [
-                          const Text(
-                            "DEFLECTION",
-                            style: TextStyle(color: Colors.grey, fontSize: 12, letterSpacing: 1),
-                          ),
+                          const Text("DEFLECTION",
+                              style: TextStyle(
+                                  color: Colors.grey,
+                                  fontSize: 12,
+                                  letterSpacing: 1)),
                           Row(
                             children: [
                               AnimatedSwitcher(
@@ -523,10 +626,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                                   ),
                                 ),
                               ),
-                              const Text(
-                                " mm",
-                                style: TextStyle(color: Colors.grey, fontSize: 14),
-                              ),
+                              const Text(" mm",
+                                  style: TextStyle(
+                                      color: Colors.grey, fontSize: 14)),
                             ],
                           ),
                         ],
@@ -537,7 +639,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   Row(
                     children: [
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 8),
                         decoration: BoxDecoration(
                           color: (_lastReading["evd"] ?? 0) >= 40
                               ? Colors.green.shade900
@@ -555,7 +658,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                             ),
                             const SizedBox(width: 8),
                             Text(
-                              (_lastReading["evd"] ?? 0) >= 40 ? "PASS" : "FAIL",
+                              (_lastReading["evd"] ?? 0) >= 40
+                                  ? "PASS"
+                                  : "FAIL",
                               style: const TextStyle(
                                 fontWeight: FontWeight.bold,
                                 color: Colors.white,
@@ -577,16 +682,28 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                                 minHeight: 8,
                                 backgroundColor: Colors.grey.shade800,
                                 valueColor: AlwaysStoppedAnimation<Color>(
-                                  _gaugeValue.value > 0.5 ? Colors.green : Colors.red,
+                                  _gaugeValue.value > 0.5
+                                      ? Colors.green
+                                      : Colors.red,
                                 ),
                               ),
                             ),
                             Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              mainAxisAlignment:
+                                  MainAxisAlignment.spaceBetween,
                               children: [
-                                Text("0", style: TextStyle(color: Colors.grey.shade500, fontSize: 10)),
-                                Text("Target 40", style: TextStyle(color: Colors.grey.shade500, fontSize: 10)),
-                                Text("80 MN/m²", style: TextStyle(color: Colors.grey.shade500, fontSize: 10)),
+                                Text("0",
+                                    style: TextStyle(
+                                        color: Colors.grey.shade500,
+                                        fontSize: 10)),
+                                Text("Target 40",
+                                    style: TextStyle(
+                                        color: Colors.grey.shade500,
+                                        fontSize: 10)),
+                                Text("80 MN/m²",
+                                    style: TextStyle(
+                                        color: Colors.grey.shade500,
+                                        fontSize: 10)),
                               ],
                             ),
                           ],
@@ -602,7 +719,9 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                         children: [
                           Icon(
                             Icons.location_on,
-                            color: _lastKnownLat != 0 ? Colors.green : Colors.grey,
+                            color: _lastKnownLat != 0
+                                ? Colors.green
+                                : Colors.grey,
                             size: 16,
                           ),
                           const SizedBox(width: 4),
@@ -610,7 +729,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                             _lastKnownLat != 0
                                 ? "${_lastKnownLat.toStringAsFixed(5)}, ${_lastKnownLng.toStringAsFixed(5)}"
                                 : "No Fix",
-                            style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
+                            style: TextStyle(
+                                color: Colors.grey.shade400, fontSize: 12),
                           ),
                         ],
                       ),
@@ -618,14 +738,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                         children: [
                           Icon(
                             Icons.satellite,
-                            color: _satellites > 3 ? Colors.green : Colors.grey,
+                            color: _satellites > 3
+                                ? Colors.green
+                                : Colors.grey,
                             size: 16,
                           ),
                           const SizedBox(width: 4),
-                          Text(
-                            "$_satellites SAT",
-                            style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
-                          ),
+                          Text("$_satellites SAT",
+                              style: TextStyle(
+                                  color: Colors.grey.shade400,
+                                  fontSize: 12)),
                         ],
                       ),
                       Row(
@@ -636,10 +758,10 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                             size: 16,
                           ),
                           const SizedBox(width: 4),
-                          Text(
-                            "#$_testCounter",
-                            style: TextStyle(color: Colors.grey.shade400, fontSize: 12),
-                          ),
+                          Text("#$_testCounter",
+                              style: TextStyle(
+                                  color: Colors.grey.shade400,
+                                  fontSize: 12)),
                         ],
                       ),
                     ],
@@ -648,7 +770,6 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               ),
             ),
             const SizedBox(height: 16),
-            // Waveform Chart
             Expanded(
               flex: 1,
               child: Container(
@@ -660,10 +781,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      "DEFLECTION WAVEFORM",
-                      style: TextStyle(color: Colors.grey, fontSize: 10, letterSpacing: 1),
-                    ),
+                    const Text("DEFLECTION WAVEFORM",
+                        style: TextStyle(
+                            color: Colors.grey,
+                            fontSize: 10,
+                            letterSpacing: 1)),
                     Expanded(
                       child: LineChart(
                         LineChartData(
@@ -672,7 +794,8 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                             drawVerticalLine: false,
                             horizontalInterval: 0.2,
                           ),
-                          titlesData: const FlTitlesData(show: false),
+                          titlesData:
+                              const FlTitlesData(show: false),
                           borderData: FlBorderData(show: false),
                           minX: 0,
                           maxX: 30,
@@ -683,14 +806,16 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                               spots: _deflectionHistory
                                   .asMap()
                                   .entries
-                                  .map((e) => FlSpot(e.key.toDouble(), e.value))
+                                  .map((e) =>
+                                      FlSpot(e.key.toDouble(), e.value))
                                   .toList(),
                               isCurved: true,
                               color: const Color(0xFF00E5FF),
                               barWidth: 2.5,
                               belowBarData: BarAreaData(
                                 show: true,
-                                color: const Color(0xFF00E5FF).withOpacity(0.1),
+                                color: const Color(0xFF00E5FF)
+                                    .withOpacity(0.1),
                               ),
                             ),
                           ],
@@ -702,7 +827,6 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               ),
             ),
             const SizedBox(height: 12),
-            // Action Buttons
             Row(
               children: [
                 Expanded(
@@ -725,11 +849,17 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
                   child: ElevatedButton.icon(
                     onPressed: () {
                       setState(() {
-                        _deflectionHistory.fillRange(0, _deflectionHistory.length, 0.0);
-                        _lastReading = {"evd": 0, "def": 0, "lat": 0, "lng": 0};
+                        _deflectionHistory.fillRange(
+                            0, _deflectionHistory.length, 0.0);
+                        _lastReading = {
+                          "evd": 0,
+                          "def": 0,
+                          "lat": 0,
+                          "lng": 0
+                        };
                         _gaugeValue.value = 0;
                       });
-                      Vibration.vibrate(duration: 30);
+                      _safeVibrate(30);
                     },
                     icon: const Icon(Icons.clear_all),
                     label: const Text("CLEAR DATA"),
@@ -750,8 +880,11 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
               alignment: Alignment.center,
               padding: const EdgeInsets.all(4),
               child: Text(
-                _isConnected ? "🟢 Live Data Streaming" : "⚪ Waiting for Connection...",
-                style: TextStyle(color: Colors.grey.shade500, fontSize: 11),
+                _isConnected
+                    ? "🟢 Live Data Streaming"
+                    : "⚪ Waiting for Connection...",
+                style:
+                    TextStyle(color: Colors.grey.shade500, fontSize: 11),
               ),
             ),
           ],
