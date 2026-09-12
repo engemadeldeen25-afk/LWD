@@ -10,14 +10,14 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # --- Updated and compatible versions ---
-  flutter_blue_plus: ^1.36.8
+  # --- Updated to versions compatible with Flutter v2 embedding ---
+  flutter_blue_plus: ^2.3.12
   fl_chart: ^0.63.0
   csv: ^5.1.1
-  permission_handler: ^11.3.1   # <-- This is the critical update
+  permission_handler: ^12.0.1   # Updated from 10.4.3
   intl: ^0.18.1
-  vibration: ^1.7.6
-  geolocator: ^9.0.2
+  vibration: ^3.2.0             # <-- Critical update from 1.7.6
+  geolocator: ^14.0.2           # Updated from 9.0.2
   shared_preferences: ^2.2.2
 
 dev_dependencies:
