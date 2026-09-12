@@ -193,7 +193,7 @@ class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin
       if (pos != null) {
         lat = pos.latitude;
         lng = pos.longitude;
-        satCount = pos.satellite ?? 0;
+        satCount = 0; // pos.satellite not available in newer geolocator
         _lastKnownLat = lat;
         _lastKnownLng = lng;
       }
